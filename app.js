@@ -16,14 +16,23 @@ const LM = {
   PINKY_MCP: 17,
 };
 
-const PINCH_THRESHOLD = 0.055;
+const PINCH_CLOSE_RATIO = 0.42;
+const PINCH_OPEN_RATIO = 0.6;
 const FRAME_PADDING = 28;
-const FREEZE_HOLD_MS = 250;
+const CAPTURE_ASPECT_RATIO = 4 / 3;
+const MIN_CAPTURE_WIDTH_RATIO = 0.34;
+const MAX_CAPTURE_WIDTH_RATIO = 0.88;
+const FRAME_SMOOTHING = 0.24;
+const FREEZE_HOLD_MS = 360;
 const COUNTDOWN_SECONDS = 3;
-const FIST_HOLD_FRAMES = 12;
-const SNAP_DISTANCE_RATIO = 0.45;
+const FIST_HOLD_MS = 650;
+const SNAP_DISTANCE_RATIO = 0.42;
 const GRID = 3;
 const LOAD_TIMEOUT_MS = 20000;
+const TARGET_DETECTION_FPS = 30;
+const DETECTION_INTERVAL_MS = 1000 / TARGET_DETECTION_FPS;
+const MEDIAPIPE_WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 const PHOTOBOOTH_CONTRAST_ALPHA = 1.3;
 const PHOTOBOOTH_BRIGHTNESS_BETA = 10;
@@ -50,6 +59,11 @@ const loaderRetry = document.getElementById("loaderRetry");
 const errorBanner = document.getElementById("errorBanner");
 const progressBadge = document.getElementById("progressBadge");
 const progressText = document.getElementById("progressText");
+const gestureHints = {
+  capture: document.getElementById("gestureCaptureHint"),
+  drag: document.getElementById("gestureDragHint"),
+  fist: document.getElementById("gestureFistHint"),
+};
 
 const galleryStrip = document.getElementById("galleryStrip");
 const galleryEmpty = document.getElementById("galleryEmpty");
@@ -59,6 +73,8 @@ const resetAllBtn = document.getElementById("resetAllBtn");
 const stripCompleteMsg = document.getElementById("stripCompleteMsg");
 
 let appState = "tracking";
+let cameraStream = null;
+let renderLoopStarted = false;
 
 const puzzle = {
   boardBox: null,
@@ -80,6 +96,7 @@ const shatter = {
 
 const STRIP_MAX_PHOTOS = 3;
 const galleryEntries = [];
+const APP_SIGNATURE = "FramePuzzle Studio";
 
 function addToGallery(snapshotCanvas) {
   if (galleryEntries.length >= STRIP_MAX_PHOTOS) return;
@@ -115,6 +132,7 @@ function updateStripDownloadAvailability() {
 const STRIP_FILE_BORDER = 24;
 const STRIP_FILE_GAP = 16;
 const STRIP_FILE_BG = "#ffffff";
+const STRIP_FILE_CAPTION_H = 42;
 
 function downloadPhotoStrip() {
   if (galleryEntries.length === 0) return;
@@ -127,6 +145,7 @@ function downloadPhotoStrip() {
 
   const totalH =
     STRIP_FILE_BORDER * 2 +
+    STRIP_FILE_CAPTION_H +
     scaledHeights.reduce((sum, h) => sum + h, 0) +
     STRIP_FILE_GAP * (entries.length - 1);
   const totalW = targetW + STRIP_FILE_BORDER * 2;
@@ -146,12 +165,23 @@ function downloadPhotoStrip() {
     cursorY += h + STRIP_FILE_GAP;
   });
 
+  stripCtx.fillStyle = "#151a20";
+  stripCtx.font = "16px 'IBM Plex Mono', monospace";
+  stripCtx.textAlign = "left";
+  stripCtx.textBaseline = "alphabetic";
+  stripCtx.fillText(APP_SIGNATURE.toUpperCase(), STRIP_FILE_BORDER, totalH - STRIP_FILE_BORDER - 14);
+
+  stripCtx.fillStyle = "#64707d";
+  stripCtx.font = "12px 'IBM Plex Mono', monospace";
+  stripCtx.textAlign = "right";
+  stripCtx.fillText(formatDateStamp(new Date()), totalW - STRIP_FILE_BORDER, totalH - STRIP_FILE_BORDER - 14);
+
   stripCanvas.toBlob((blob) => {
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `puzzlecam_tira_${Date.now()}.png`;
+    link.download = `framepuzzle_roll_${Date.now()}.png`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -170,7 +200,7 @@ function resetEverything() {
   hideStripComplete();
   updateStripDownloadAvailability();
   resetPuzzleOnly();
-  statusText.textContent = "todo reiniciado";
+  statusText.textContent = "session cleared";
 }
 
 function renderGalleryThumb(snapshotCanvas, index) {
@@ -186,11 +216,30 @@ function renderGalleryThumb(snapshotCanvas, index) {
 
   const label = document.createElement("div");
   label.className = "print-label";
-  label.textContent = `#${String(index).padStart(2, "0")}`;
+  label.textContent = `take ${String(index).padStart(2, "0")}`;
+
+  const meta = document.createElement("div");
+  meta.className = "print-meta";
+  meta.textContent = formatClock(new Date());
 
   print.appendChild(thumbCanvas);
   print.appendChild(label);
+  print.appendChild(meta);
   galleryStrip.insertBefore(print, galleryStrip.firstChild);
+}
+
+function formatClock(date) {
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatDateStamp(date) {
+  return date.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function resetPuzzleOnly() {
@@ -205,7 +254,9 @@ function resetPuzzleOnly() {
   shatter.active = false;
   shatter.fragments = [];
   shatter.pendingCanvas = null;
-  fistHoldCounter = 0;
+  freezeGate.holding = false;
+  fistHoldStartedAt = 0;
+  pinchStates.clear();
   lastSeenFrame.box = null;
   lastSeenFrame.at = 0;
   updateProgressBadge();
@@ -215,17 +266,12 @@ function fitCanvasToWindow() {
   const stageEl = document.getElementById("stage");
   const vw = stageEl.clientWidth;
   const vh = stageEl.clientHeight;
-  const videoAspect = canvas.width / canvas.height;
-  const containerAspect = vw / vh;
+  if (!vw || !vh || !canvas.width || !canvas.height) return;
 
-  let cssWidth, cssHeight;
-  if (containerAspect > videoAspect) {
-    cssWidth = vw;
-    cssHeight = vw / videoAspect;
-  } else {
-    cssHeight = vh;
-    cssWidth = vh * videoAspect;
-  }
+  // Keep the complete camera frame visible instead of cropping it to fill the stage.
+  const scale = Math.min(vw / canvas.width, vh / canvas.height);
+  const cssWidth = Math.max(1, Math.round(canvas.width * scale));
+  const cssHeight = Math.max(1, Math.round(canvas.height * scale));
 
   canvas.style.width = `${cssWidth}px`;
   canvas.style.height = `${cssHeight}px`;
@@ -233,23 +279,111 @@ function fitCanvasToWindow() {
 
 window.addEventListener("resize", fitCanvasToWindow);
 
+function isMacOS() {
+  const platform = navigator.platform || "";
+  const ua = navigator.userAgent || "";
+  return /Mac/.test(platform) || (/Mac OS X/.test(ua) && !/iPhone|iPad|iPod/.test(ua));
+}
+
+function isSafariBrowser() {
+  const ua = navigator.userAgent || "";
+  return /Safari/i.test(ua) && !/Chrome|CriOS|Edg|OPR|Firefox|FxiOS/i.test(ua);
+}
+
+function buildCameraProfile(width, height) {
+  const supported = navigator.mediaDevices.getSupportedConstraints?.() || {};
+  const video = {
+    width: { ideal: width },
+    height: { ideal: height },
+    frameRate: { ideal: 30, max: 30 },
+    facingMode: { ideal: "user" },
+  };
+
+  // Ask the browser to preserve the native camera view when that constraint exists.
+  if (supported.resizeMode) video.resizeMode = { ideal: "none" };
+
+  return { video, audio: false };
+}
+
+function getCameraProfiles() {
+  return [
+    buildCameraProfile(1280, 720),
+    buildCameraProfile(960, 540),
+    { video: true, audio: false },
+  ];
+}
+
+async function requestCameraStream() {
+  let lastError;
+  for (const constraints of getCameraProfiles()) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      lastError = err;
+      if (err && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
+        throw err;
+      }
+    }
+  }
+  throw lastError || new Error("Unable to start the camera.");
+}
+
+async function configureCameraFraming(stream) {
+  const track = stream.getVideoTracks()[0];
+  if (!track || typeof track.getCapabilities !== "function" || typeof track.applyConstraints !== "function") {
+    return;
+  }
+
+  let capabilities;
+  try {
+    capabilities = track.getCapabilities();
+  } catch (err) {
+    return;
+  }
+
+  const preferred = {};
+  if (capabilities.zoom && Number.isFinite(capabilities.zoom.min)) {
+    preferred.zoom = capabilities.zoom.min;
+  }
+  if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes("continuous")) {
+    preferred.focusMode = "continuous";
+  }
+
+  if (Object.keys(preferred).length === 0) return;
+
+  try {
+    await track.applyConstraints({ advanced: [preferred] });
+  } catch (err) {
+    console.info("[FramePuzzle] Native camera framing controls are unavailable.", err);
+  }
+}
+
+function stopCameraStream() {
+  const stream = cameraStream || videoEl.srcObject;
+  if (stream && typeof stream.getTracks === "function") {
+    stream.getTracks().forEach((track) => track.stop());
+  }
+  cameraStream = null;
+  videoEl.srcObject = null;
+}
+
 async function initWebcam() {
   if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error("Este navegador no soporta getUserMedia.");
+    throw new Error("This browser does not support webcam access.");
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-    audio: false,
-  });
-  videoEl.srcObject = stream;
 
-  await new Promise((resolve) => {
-    videoEl.onloadedmetadata = () => {
-      videoEl.play();
-      resolve();
-    };
-  });
+  cameraStream = await requestCameraStream();
+  await configureCameraFraming(cameraStream);
+  videoEl.srcObject = cameraStream;
 
+  if (videoEl.readyState < 1) {
+    await new Promise((resolve, reject) => {
+      videoEl.onloadedmetadata = () => resolve();
+      videoEl.onerror = () => reject(new Error("The camera stream could not be read."));
+    });
+  }
+
+  await videoEl.play();
   canvas.width = videoEl.videoWidth;
   canvas.height = videoEl.videoHeight;
   fitCanvasToWindow();
@@ -267,59 +401,47 @@ async function initHandLandmarker() {
   let vision;
   try {
     vision = await withTimeout(
-      FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-      ),
+      FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL),
       LOAD_TIMEOUT_MS,
-      "Tiempo de espera agotado cargando el runtime de MediaPipe (WASM). Revisa tu conexión a internet o si cdn.jsdelivr.net está bloqueado."
+      "Timed out loading the MediaPipe WASM runtime. Check your connection or whether cdn.jsdelivr.net is blocked."
     );
   } catch (err) {
     throw err;
   }
 
-  try {
-    const handLandmarker = await withTimeout(
-      HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate: "GPU",
-        },
-        runningMode: "video",
-        numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
-      }),
-      LOAD_TIMEOUT_MS,
-      "Tiempo de espera agotado descargando el modelo HandLandmarker (~10MB) con GPU."
-    );
-    return handLandmarker;
-  } catch (gpuErr) {
-    console.warn("[PuzzleCam] Falló con delegate GPU, reintentando con CPU…", gpuErr);
+  let lastError;
+  for (const delegate of getHandDelegateOrder()) {
+    try {
+      return await withTimeout(
+        createHandLandmarker(vision, delegate),
+        LOAD_TIMEOUT_MS,
+        `Timed out loading the HandLandmarker model with ${delegate}.`
+      );
+    } catch (err) {
+      lastError = err;
+      console.warn(`[FramePuzzle] ${delegate} delegate failed, trying the next mode.`, err);
+    }
   }
 
-  try {
-    const handLandmarker = await withTimeout(
-      HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate: "CPU",
-        },
-        runningMode: "video",
-        numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
-      }),
-      LOAD_TIMEOUT_MS,
-      "Tiempo de espera agotado descargando el modelo HandLandmarker (~10MB) incluso con CPU. Revisa tu conexión o si storage.googleapis.com está bloqueado en tu red."
-    );
-    return handLandmarker;
-  } catch (cpuErr) {
-    throw cpuErr;
-  }
+  throw lastError || new Error("Unable to load the HandLandmarker model.");
+}
+
+function getHandDelegateOrder() {
+  return isSafariBrowser() ? ["CPU", "GPU"] : ["GPU", "CPU"];
+}
+
+function createHandLandmarker(vision, delegate) {
+  return HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: HAND_MODEL_URL,
+      delegate,
+    },
+    runningMode: "video",
+    numHands: 2,
+    minHandDetectionConfidence: 0.6,
+    minHandPresenceConfidence: 0.6,
+    minTrackingConfidence: 0.6,
+  });
 }
 
 function dist2D(a, b) {
@@ -328,8 +450,36 @@ function dist2D(a, b) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
-function isPinching(landmarks) {
-  return dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) < PINCH_THRESHOLD;
+const pinchStates = new Map();
+
+function getHandScale(landmarks) {
+  const palmWidth = dist2D(landmarks[LM.INDEX_MCP], landmarks[LM.PINKY_MCP]);
+  const palmLength = dist2D(landmarks[LM.WRIST], landmarks[LM.MIDDLE_MCP]);
+  return Math.max(0.04, (palmWidth + palmLength) / 2);
+}
+
+function isPinching(landmarks, handId) {
+  const pinchRatio = dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) /
+    getHandScale(landmarks);
+  const wasPinching = pinchStates.get(handId) || false;
+  const threshold = wasPinching ? PINCH_OPEN_RATIO : PINCH_CLOSE_RATIO;
+  const pinching = pinchRatio <= threshold;
+  pinchStates.set(handId, pinching);
+  return pinching;
+}
+
+function getHandId(result, index) {
+  const category =
+    result.handednesses?.[index]?.[0]?.categoryName ||
+    result.handedness?.[index]?.[0]?.categoryName;
+  return category ? `hand-${category.toLowerCase()}` : `hand-${index}`;
+}
+
+function getTrackedHands(result) {
+  return (result.landmarks || []).map((landmarks, index) => ({
+    landmarks,
+    id: getHandId(result, index),
+  }));
 }
 
 function isFist(landmarks) {
@@ -355,21 +505,53 @@ function mirrorLandmarkX(landmark) {
   return { x: 1 - landmark.x, y: landmark.y };
 }
 
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function stabilizeFrame(nextBox) {
+  const isRecent = lastSeenFrame.box &&
+    performance.now() - lastSeenFrame.at < FRAME_GRACE_MS;
+  if (!isRecent) return nextBox;
+
+  const previous = lastSeenFrame.box;
+  return {
+    x: previous.x + (nextBox.x - previous.x) * FRAME_SMOOTHING,
+    y: previous.y + (nextBox.y - previous.y) * FRAME_SMOOTHING,
+    width: previous.width + (nextBox.width - previous.width) * FRAME_SMOOTHING,
+    height: previous.height + (nextBox.height - previous.height) * FRAME_SMOOTHING,
+  };
+}
+
 function computeHandFrame(indexTipA, indexTipB) {
   const a = toPixel(indexTipA);
   const b = toPixel(indexTipB);
+  const centerX = (a.x + b.x) / 2;
+  const centerY = (a.y + b.y) / 2;
+  const span = Math.hypot(a.x - b.x, a.y - b.y);
 
-  const minX = Math.min(a.x, b.x) - FRAME_PADDING;
-  const maxX = Math.max(a.x, b.x) + FRAME_PADDING;
-  const minY = Math.min(a.y, b.y) - FRAME_PADDING;
-  const maxY = Math.max(a.y, b.y) + FRAME_PADDING;
+  const rawWidth = Math.max(
+    Math.abs(a.x - b.x) + FRAME_PADDING * 2,
+    (Math.abs(a.y - b.y) + FRAME_PADDING * 2) * CAPTURE_ASPECT_RATIO,
+    span * 1.12
+  );
+  const maxWidth = Math.max(
+    1,
+    Math.min(
+      canvas.width * MAX_CAPTURE_WIDTH_RATIO,
+      canvas.height * CAPTURE_ASPECT_RATIO * 0.9
+    )
+  );
+  const minWidth = Math.min(maxWidth, canvas.width * MIN_CAPTURE_WIDTH_RATIO);
+  const width = clamp(rawWidth, minWidth, maxWidth);
+  const height = width / CAPTURE_ASPECT_RATIO;
 
-  const x = Math.max(0, minX);
-  const y = Math.max(0, minY);
-  const width = Math.min(canvas.width, maxX) - x;
-  const height = Math.min(canvas.height, maxY) - y;
-
-  return { x, y, width, height };
+  return {
+    x: clamp(centerX - width / 2, 0, canvas.width - width),
+    y: clamp(centerY - height / 2, 0, canvas.height - height),
+    width,
+    height,
+  };
 }
 
 const freezeGate = { holding: false, since: 0 };
@@ -401,7 +583,7 @@ function drawCountdownOverlay(box) {
   applyBWInsideBox(box);
 
   ctx.save();
-  ctx.strokeStyle = "#f5c518";
+  ctx.strokeStyle = "#35d0ba";
   ctx.lineWidth = 3;
   ctx.strokeRect(box.x, box.y, box.width, box.height);
 
@@ -409,17 +591,17 @@ function drawCountdownOverlay(box) {
   const cx = box.x + box.width / 2;
   const cy = box.y + box.height / 2;
 
-  ctx.fillStyle = "rgba(10,10,8,0.45)";
+  ctx.fillStyle = "rgba(5,6,9,0.48)";
   ctx.fillRect(box.x, box.y, box.width, box.height);
 
   ctx.font = `${Math.max(48, Math.min(box.width, box.height) * 0.4)}px 'IBM Plex Mono', monospace`;
-  ctx.fillStyle = "#f5c518";
+  ctx.fillStyle = "#ffca3a";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(String(n), cx, cy);
   ctx.restore();
 
-  statusText.textContent = `capturando en ${n}…`;
+  statusText.textContent = `capturing in ${n}...`;
 }
 
 function gaussianNoise(std) {
@@ -447,6 +629,19 @@ function shuffle(arr) {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
+}
+
+function createDerangedSlotOrder(length) {
+  const indexes = Array.from({ length }, (_, index) => index);
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const order = shuffle([...indexes]);
+    if (order.every((slotIndex, pieceIndex) => slotIndex !== pieceIndex)) {
+      return order;
+    }
+  }
+
+  // A rotation is always a valid fallback for a puzzle with more than one tile.
+  return indexes.map((_, index) => (index + 1) % length);
 }
 
 function finishCountdownAndCapture(box) {
@@ -511,24 +706,70 @@ function finishCountdownAndCapture(box) {
       slots.push({ x: box.x + col * tileW, y: box.y + row * tileH });
     }
   }
-  shuffle(slots);
+  const slotOrder = createDerangedSlotOrder(slots.length);
 
-  pieces.forEach((piece, i) => {
-    piece.x = slots[i].x;
-    piece.y = slots[i].y;
-    if (isNearOwnCell(piece, box, tileW, tileH)) {
-      snapPieceToCell(piece, box, tileW, tileH);
-    }
+  pieces.forEach((piece, index) => {
+    const slot = slots[slotOrder[index]];
+    piece.x = slot.x;
+    piece.y = slot.y;
+    piece.placed = false;
   });
 
   puzzle.boardBox = box;
   puzzle.pieces = pieces;
   puzzle.tileW = tileW;
   puzzle.tileH = tileH;
-  puzzle.solved = pieces.every((p) => p.placed);
+  puzzle.solved = false;
   appState = "puzzle";
-  fistHoldCounter = 0;
+  fistHoldStartedAt = 0;
   updateProgressBadge();
+}
+
+function correctCellPosition(piece, box, tileW, tileH) {
+  return {
+    x: box.x + piece.col * tileW,
+    y: box.y + piece.row * tileH,
+  };
+}
+
+function isNearOwnCell(piece, box, tileW, tileH) {
+  const target = correctCellPosition(piece, box, tileW, tileH);
+  const dx = piece.x - target.x;
+  const dy = piece.y - target.y;
+  const tolerance = Math.min(tileW, tileH) * SNAP_DISTANCE_RATIO;
+  return Math.hypot(dx, dy) <= tolerance;
+}
+
+function isLockedToOwnCell(piece, box, tileW, tileH) {
+  const target = correctCellPosition(piece, box, tileW, tileH);
+  return Math.abs(piece.x - target.x) < 1 && Math.abs(piece.y - target.y) < 1;
+}
+
+function reconcilePlacedState(box, tileW, tileH) {
+  if (!box || !puzzle.pieces.length) return false;
+  for (const piece of puzzle.pieces) {
+    if (piece.dragging) continue;
+    piece.placed = isLockedToOwnCell(piece, box, tileW, tileH);
+  }
+  return puzzle.pieces.every((piece) => piece.placed);
+}
+
+function snapPieceToCell(piece, box, tileW, tileH) {
+  const target = correctCellPosition(piece, box, tileW, tileH);
+  piece.x = target.x;
+  piece.y = target.y;
+  piece.placed = true;
+}
+
+function findPieceAtCell(row, col, excludedPiece = null) {
+  const cellX = puzzle.boardBox.x + col * puzzle.tileW;
+  const cellY = puzzle.boardBox.y + row * puzzle.tileH;
+  return puzzle.pieces.find((piece) =>
+    piece !== excludedPiece &&
+    !piece.dragging &&
+    Math.abs(piece.x - cellX) < 1 &&
+    Math.abs(piece.y - cellY) < 1
+  );
 }
 
 const drag = {
@@ -536,180 +777,124 @@ const drag = {
   piece: null,
   offsetX: 0,
   offsetY: 0,
+  originX: 0,
+  originY: 0,
 };
 
-function isNearOwnCell(piece, box, tileW, tileH) {
-  const correctX = box.x + piece.col * tileW;
-  const correctY = box.y + piece.row * tileH;
-  const dx = piece.x - correctX;
-  const dy = piece.y - correctY;
-  const tolerance = Math.min(tileW, tileH) * SNAP_DISTANCE_RATIO;
-  return Math.sqrt(dx * dx + dy * dy) < tolerance;
-}
-
-function reconcilePlacedState(box, tileW, tileH) {
-  if (!box || !puzzle.pieces.length) return false;
-  for (const piece of puzzle.pieces) {
-    if (piece.displacing || piece.dragging) continue;
-    piece.placed = isNearOwnCell(piece, box, tileW, tileH);
-  }
-  return puzzle.pieces.every((p) => p.placed);
-}
-
-function snapPieceToCell(piece, box, tileW, tileH) {
-  displaceCellOccupant(piece, piece.row, piece.col, box, tileW, tileH);
-  piece.x = box.x + piece.col * tileW;
-  piece.y = box.y + piece.row * tileH;
-  piece.placed = true;
-}
-
-function displaceCellOccupant(piece, targetRow, targetCol, box, tileW, tileH) {
-  const cellX = box.x + targetCol * tileW;
-  const cellY = box.y + targetRow * tileH;
-
-  const occupant = puzzle.pieces.find((p) => {
-    if (p === piece || p.displacing) return false;
-    const cx = p.x + p.w / 2;
-    const cy = p.y + p.h / 2;
-    return (
-      cx >= cellX && cx < cellX + tileW &&
-      cy >= cellY && cy < cellY + tileH
-    );
-  });
-  if (!occupant) return;
-
-  if (occupant.row === targetRow && occupant.col === targetCol && occupant.placed) {
-    return;
-  }
-
-  occupant.placed = false;
-
-  const freeCells = [];
-  for (let row = 0; row < GRID; row++) {
-    for (let col = 0; col < GRID; col++) {
-      if (row === targetRow && col === targetCol) continue;
-      const cx0 = box.x + col * tileW;
-      const cy0 = box.y + row * tileH;
-      const taken = puzzle.pieces.some((p) => {
-        if (p === occupant || p === piece || p.displacing) return false;
-        const cx = p.x + p.w / 2;
-        const cy = p.y + p.h / 2;
-        return cx >= cx0 && cx < cx0 + tileW && cy >= cy0 && cy < cy0 + tileH;
-      });
-      if (!taken) freeCells.push({ row, col });
-    }
-  }
-
-  let targetSlot;
-  if (freeCells.length > 0) {
-    targetSlot = freeCells[Math.floor(Math.random() * freeCells.length)];
-  } else {
-    targetSlot = { row: occupant.row, col: occupant.col };
-  }
-
-  const jitterX = (Math.random() - 0.5) * tileW * 0.5;
-  const jitterY = (Math.random() - 0.5) * tileH * 0.5;
-  const targetX = box.x + targetSlot.col * tileW + jitterX;
-  const targetY = box.y + targetSlot.row * tileH + jitterY;
-
-  animateDisplacement(occupant, targetX, targetY, box);
-}
-
-const DISPLACE_ANIM_MS = 220;
-
-function animateDisplacement(piece, targetX, targetY, box) {
-  const startX = piece.x;
-  const startY = piece.y;
-  const startedAt = performance.now();
-
-  piece.displacing = true;
-
-  function step() {
-    const t = Math.min(1, (performance.now() - startedAt) / DISPLACE_ANIM_MS);
-    const eased = 1 - Math.pow(1 - t, 3);
-
-    piece.x = startX + (targetX - startX) * eased;
-    piece.y = startY + (targetY - startY) * eased;
-
-    if (t < 1) {
-      requestAnimationFrame(step);
-    } else {
-      piece.x = targetX;
-      piece.y = targetY;
-      piece.displacing = false;
-      clampPieceToBoard(piece);
-    }
-  }
-
-  requestAnimationFrame(step);
-}
-
 function findNearestPiece(px, py) {
-  let best = null;
-  let bestDist = Infinity;
-  for (const piece of puzzle.pieces) {
-    if (piece.displacing) continue;
-    const cx = piece.x + piece.w / 2;
-    const cy = piece.y + piece.h / 2;
-    const d = Math.hypot(px - cx, py - cy);
-    if (d < Math.max(piece.w, piece.h) * 0.75 && d < bestDist) {
-      best = piece;
-      bestDist = d;
+  return puzzle.pieces.find((piece) =>
+    !piece.placed &&
+    !piece.dragging &&
+    px >= piece.x - 8 &&
+    px <= piece.x + piece.w + 8 &&
+    py >= piece.y - 8 &&
+    py <= piece.y + piece.h + 8
+  ) || null;
+}
+
+function beginDrag(handLabel, point) {
+  if (drag.activeHand !== null) return;
+
+  const candidate = findNearestPiece(point.x, point.y);
+  if (!candidate) return;
+
+  drag.activeHand = handLabel;
+  drag.piece = candidate;
+  drag.offsetX = point.x - candidate.x;
+  drag.offsetY = point.y - candidate.y;
+  drag.originX = candidate.x;
+  drag.originY = candidate.y;
+  candidate.dragging = true;
+  candidate.placed = false;
+}
+
+function moveActivePiece(handLabel, point) {
+  if (drag.activeHand !== handLabel || !drag.piece) return;
+  drag.piece.x = point.x - drag.offsetX;
+  drag.piece.y = point.y - drag.offsetY;
+  clampPieceToBoard(drag.piece);
+}
+
+function finishActiveDrag(handLabel) {
+  if (drag.activeHand !== handLabel || !drag.piece) return;
+
+  const piece = drag.piece;
+  piece.dragging = false;
+
+  if (isNearOwnCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH)) {
+    const occupant = findPieceAtCell(piece.row, piece.col, piece);
+    if (occupant) {
+      occupant.x = drag.originX;
+      occupant.y = drag.originY;
+      occupant.placed = false;
     }
+    snapPieceToCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH);
+  } else {
+    // Keep the board coherent after a missed drop instead of leaving tiles overlapped.
+    piece.x = drag.originX;
+    piece.y = drag.originY;
+    piece.placed = false;
   }
-  return best;
+
+  drag.activeHand = null;
+  drag.piece = null;
+  puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
+  updateProgressBadge();
 }
 
 function handleDragForHand(handLabel, pinching, indexPx) {
   if (pinching) {
     if (drag.activeHand === null) {
-      const candidate = findNearestPiece(indexPx.x, indexPx.y);
-      if (candidate) {
-        drag.activeHand = handLabel;
-        drag.piece = candidate;
-        drag.offsetX = indexPx.x - candidate.x;
-        drag.offsetY = indexPx.y - candidate.y;
-        candidate.dragging = true;
-        candidate.placed = false;
-      }
-    } else if (drag.activeHand === handLabel && drag.piece) {
-      drag.piece.x = indexPx.x - drag.offsetX;
-      drag.piece.y = indexPx.y - drag.offsetY;
+      beginDrag(handLabel, indexPx);
+    } else {
+      moveActivePiece(handLabel, indexPx);
     }
   } else {
-    if (drag.activeHand === handLabel && drag.piece) {
-      const piece = drag.piece;
-      piece.dragging = false;
-      if (isNearOwnCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH)) {
-        snapPieceToCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-      } else {
-        clampPieceToBoard(piece);
-        const box = puzzle.boardBox;
-        const cx = piece.x + piece.w / 2;
-        const cy = piece.y + piece.h / 2;
-        const dropCol = Math.min(
-          GRID - 1,
-          Math.max(0, Math.floor((cx - box.x) / puzzle.tileW))
-        );
-        const dropRow = Math.min(
-          GRID - 1,
-          Math.max(0, Math.floor((cy - box.y) / puzzle.tileH))
-        );
-        displaceCellOccupant(piece, dropRow, dropCol, box, puzzle.tileW, puzzle.tileH);
-      }
-      drag.activeHand = null;
-      drag.piece = null;
-      puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-      updateProgressBadge();
-    }
+    finishActiveDrag(handLabel);
   }
 }
 
 function clampPieceToBoard(piece) {
   const box = puzzle.boardBox;
-  piece.x = Math.min(Math.max(piece.x, box.x), box.x + box.width - piece.w);
-  piece.y = Math.min(Math.max(piece.y, box.y), box.y + box.height - piece.h);
+  piece.x = clamp(piece.x, box.x, box.x + box.width - piece.w);
+  piece.y = clamp(piece.y, box.y, box.y + box.height - piece.h);
 }
+
+function pointFromPointerEvent(event) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (event.clientX - rect.left) * (canvas.width / rect.width),
+    y: (event.clientY - rect.top) * (canvas.height / rect.height),
+  };
+}
+
+function bindPointerControls() {
+  canvas.addEventListener("pointerdown", (event) => {
+    if (appState !== "puzzle" || drag.activeHand !== null) return;
+    beginDrag("pointer", pointFromPointerEvent(event));
+    if (drag.activeHand === "pointer") {
+      canvas.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    }
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    if (drag.activeHand !== "pointer") return;
+    moveActivePiece("pointer", pointFromPointerEvent(event));
+    event.preventDefault();
+  });
+
+  const endPointerDrag = (event) => {
+    if (drag.activeHand !== "pointer") return;
+    finishActiveDrag("pointer");
+    event.preventDefault();
+  };
+
+  canvas.addEventListener("pointerup", endPointerDrag);
+  canvas.addEventListener("pointercancel", endPointerDrag);
+}
+
+bindPointerControls();
 
 function drawBoardAndPieces() {
   const box = puzzle.boardBox;
@@ -739,31 +924,31 @@ function drawBoardAndPieces() {
   for (const piece of sorted) {
     ctx.save();
     if (piece.dragging) {
-      ctx.shadowColor = "rgba(245,197,24,0.9)";
+      ctx.shadowColor = "rgba(53,208,186,0.9)";
       ctx.shadowBlur = 14;
     }
     ctx.drawImage(piece.canvas, piece.x, piece.y, piece.w, piece.h);
-    ctx.strokeStyle = piece.placed ? "#5fae6e" : "rgba(234,229,214,0.5)";
+    ctx.strokeStyle = piece.placed ? "#7bd88f" : "rgba(244,240,232,0.5)";
     ctx.lineWidth = piece.dragging ? 3 : 1.5;
     ctx.strokeRect(piece.x, piece.y, piece.w, piece.h);
     ctx.restore();
   }
 
   ctx.save();
-  ctx.strokeStyle = puzzle.solved ? "#5fae6e" : "#f5c518";
+  ctx.strokeStyle = puzzle.solved ? "#7bd88f" : "#35d0ba";
   ctx.lineWidth = 3;
   ctx.strokeRect(box.x, box.y, box.width, box.height);
   ctx.restore();
 
   if (puzzle.solved) {
     ctx.save();
-    ctx.fillStyle = "rgba(95,174,110,0.15)";
+    ctx.fillStyle = "rgba(123,216,143,0.15)";
     ctx.fillRect(box.x, box.y, box.width, box.height);
     ctx.font = `${Math.max(20, box.width * 0.07)}px 'IBM Plex Mono', monospace`;
-    ctx.fillStyle = "#5fae6e";
+    ctx.fillStyle = "#7bd88f";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("¡COMPLETO! — puño para guardar", box.x + box.width / 2, box.y + box.height / 2);
+    ctx.fillText("COMPLETE - hold fist to save", box.x + box.width / 2, box.y + box.height / 2);
     ctx.restore();
   }
 }
@@ -774,9 +959,23 @@ function updateProgressBadge() {
     return;
   }
   const placedCount = puzzle.pieces.filter((p) => p.placed).length;
-  progressText.textContent = `${placedCount} / ${puzzle.pieces.length} piezas colocadas`;
+  progressText.textContent = `${placedCount} / ${puzzle.pieces.length} pieces placed`;
   progressBadge.classList.add("visible");
   progressBadge.classList.toggle("solved", puzzle.solved);
+}
+
+function updateGestureGuide() {
+  let activeGesture = "capture";
+
+  if (appState === "puzzle") {
+    activeGesture = puzzle.solved ? "fist" : "drag";
+  } else if (appState === "shattering" || (appState === "tracking" && isStripFull())) {
+    activeGesture = null;
+  }
+
+  Object.entries(gestureHints).forEach(([gesture, el]) => {
+    if (el) el.classList.toggle("active", gesture === activeGesture);
+  });
 }
 
 function drawVideoFrame() {
@@ -801,7 +1000,7 @@ function applyBWInsideBox(box) {
 
 function drawLiveFrameOverlay(box) {
   ctx.save();
-  ctx.strokeStyle = "#f5c518";
+  ctx.strokeStyle = "#35d0ba";
   ctx.lineWidth = 3;
   ctx.strokeRect(box.x, box.y, box.width, box.height);
 
@@ -964,7 +1163,7 @@ function finishShatter() {
   shatter.fragments = [];
   if (shatter.pendingCanvas) {
     addToGallery(shatter.pendingCanvas);
-    statusText.textContent = "¡guardado en la tira!";
+    statusText.textContent = "saved to the roll";
     shatter.pendingCanvas = null;
   }
   resetPuzzleOnly();
@@ -972,7 +1171,7 @@ function finishShatter() {
 
 function handleFistReset() {
   if (appState !== "puzzle") {
-    statusText.textContent = "reiniciado (puño)";
+    statusText.textContent = "board reset by fist hold";
     resetPuzzleOnly();
     return;
   }
@@ -984,31 +1183,37 @@ function handleFistReset() {
     shatter.pendingCanvas = puzzle.fullPhotoboothCanvas;
     startShatter(puzzle.fullPhotoboothCanvas, puzzle.boardBox);
   } else {
-    statusText.textContent = "reiniciado (puño)";
+    statusText.textContent = "board reset by fist hold";
     resetPuzzleOnly();
   }
 }
 
 let handLandmarker = null;
-let fistHoldCounter = 0;
+let fistHoldStartedAt = 0;
+
+function getFistHoldProgress() {
+  if (!fistHoldStartedAt) return 0;
+  return Math.min(1, (performance.now() - fistHoldStartedAt) / FIST_HOLD_MS);
+}
 
 function processResults(result) {
   if (appState === "shattering") {
     updateAndDrawShatter();
-    statusText.textContent = "guardando…";
+    statusText.textContent = "saving...";
     return;
   }
 
-  const handsLandmarks = result.landmarks || [];
-  const noHands = handsLandmarks.length === 0;
+  const hands = getTrackedHands(result);
+  const noHands = hands.length === 0;
 
   if (noHands) {
     statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot";
-    fistHoldCounter = 0;
+    fistHoldStartedAt = 0;
     freezeGate.holding = false;
+    pinchStates.clear();
 
-    if (drag.activeHand && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+    if (drag.activeHand && drag.activeHand !== "pointer" && drag.piece) {
+      finishActiveDrag(drag.activeHand);
     }
 
     if (appState === "tracking") {
@@ -1018,8 +1223,8 @@ function processResults(result) {
         drawLiveFrameOverlay(lastSeenFrame.box);
       }
       statusText.textContent = isStripFull()
-        ? "tira completa — descarga o reinicia"
-        : "buscando manos…";
+        ? "roll complete - download or clear"
+        : "looking for hands...";
       return;
     }
 
@@ -1033,63 +1238,63 @@ function processResults(result) {
       updateProgressBadge();
       drawBoardAndPieces();
       statusText.textContent = puzzle.solved
-        ? "¡rompecabezas completo! cierra el puño para guardarlo"
-        : "arma el rompecabezas con pinch";
-      return;
+        ? "puzzle complete - hold fist to save"
+        : "assemble the puzzle with pinch";
     }
-
     return;
   }
 
   statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot live";
 
-  const anyFist = handsLandmarks.some((lm) => isFist(lm));
+  const anyFist = hands.some(({ landmarks }) => isFist(landmarks));
   const draggingNow = drag.activeHand !== null && drag.piece !== null;
-  if (anyFist && !draggingNow && appState !== "tracking") {
-    fistHoldCounter++;
-    if (fistHoldCounter >= FIST_HOLD_FRAMES) {
-      fistHoldCounter = 0;
+
+  // Once the countdown begins, preserve it regardless of the pose the user makes.
+  if (appState === "puzzle" && anyFist && !draggingNow) {
+    if (!fistHoldStartedAt) fistHoldStartedAt = performance.now();
+    if (performance.now() - fistHoldStartedAt >= FIST_HOLD_MS) {
+      fistHoldStartedAt = 0;
       handleFistReset();
       return;
     }
   } else {
-    fistHoldCounter = 0;
+    fistHoldStartedAt = 0;
   }
 
   if (appState === "tracking") {
     if (isStripFull()) {
-      statusText.textContent = "tira completa — descarga o reinicia";
+      statusText.textContent = "roll complete - download or clear";
       return;
     }
-    if (handsLandmarks.length === 2) {
-      const [handA, handB] = handsLandmarks;
-      const indexA = mirrorLandmarkX(handA[LM.INDEX_TIP]);
-      const indexB = mirrorLandmarkX(handB[LM.INDEX_TIP]);
-      const frameBox = computeHandFrame(indexA, indexB);
 
-      if (frameBox.width > 4 && frameBox.height > 4) {
-        applyBWInsideBox(frameBox);
-        drawLiveFrameOverlay(frameBox);
-        lastSeenFrame.box = frameBox;
-        lastSeenFrame.at = performance.now();
-      }
+    if (hands.length === 2) {
+      const [handA, handB] = hands;
+      const indexA = mirrorLandmarkX(handA.landmarks[LM.INDEX_TIP]);
+      const indexB = mirrorLandmarkX(handB.landmarks[LM.INDEX_TIP]);
+      const frameBox = stabilizeFrame(computeHandFrame(indexA, indexB));
 
-      const bothPinching = isPinching(handA) && isPinching(handB);
-      if (bothPinching && frameBox.width > 40 && frameBox.height > 40) {
+      applyBWInsideBox(frameBox);
+      drawLiveFrameOverlay(frameBox);
+      lastSeenFrame.box = frameBox;
+      lastSeenFrame.at = performance.now();
+
+      const bothPinching = isPinching(handA.landmarks, handA.id) &&
+        isPinching(handB.landmarks, handB.id);
+      if (bothPinching) {
         if (!freezeGate.holding) {
           freezeGate.holding = true;
           freezeGate.since = performance.now();
         }
         statusDot.className = "status-dot armed";
-        statusText.textContent = "sostén el pinch…";
+        statusText.textContent = "hold the pinch...";
 
-        if (performance.now() - freezeGate.since > FREEZE_HOLD_MS) {
+        if (performance.now() - freezeGate.since >= FREEZE_HOLD_MS) {
           freezeGate.holding = false;
           startCountdown(frameBox);
         }
       } else {
         freezeGate.holding = false;
-        statusText.textContent = "manos en seguimiento";
+        statusText.textContent = "hands tracked - set your frame";
       }
     } else {
       freezeGate.holding = false;
@@ -1097,10 +1302,8 @@ function processResults(result) {
       if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
         applyBWInsideBox(lastSeenFrame.box);
         drawLiveFrameOverlay(lastSeenFrame.box);
-        statusText.textContent = "manos en seguimiento";
-      } else {
-        statusText.textContent = "manos en seguimiento";
       }
+      statusText.textContent = "use two hands to set the frame";
     }
     return;
   }
@@ -1111,17 +1314,21 @@ function processResults(result) {
   }
 
   if (appState === "puzzle") {
-    const labelsPresent = new Set();
-    handsLandmarks.forEach((lm, i) => {
-      const label = i === 0 ? "A" : "B";
-      labelsPresent.add(label);
-      const pinching = isPinching(lm);
-      const indexPx = toPixel(mirrorLandmarkX(lm[LM.INDEX_TIP]));
-      handleDragForHand(label, pinching, indexPx);
+    const activeHandIds = new Set();
+    hands.forEach(({ landmarks, id }) => {
+      activeHandIds.add(id);
+      const pinching = isPinching(landmarks, id);
+      const indexPx = toPixel(mirrorLandmarkX(landmarks[LM.INDEX_TIP]));
+      handleDragForHand(id, pinching, indexPx);
     });
 
-    if (drag.activeHand && !labelsPresent.has(drag.activeHand) && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+    if (
+      drag.activeHand &&
+      drag.activeHand !== "pointer" &&
+      !activeHandIds.has(drag.activeHand) &&
+      drag.piece
+    ) {
+      finishActiveDrag(drag.activeHand);
     }
 
     if (!drag.piece) {
@@ -1130,23 +1337,44 @@ function processResults(result) {
     }
 
     drawBoardAndPieces();
-    drawHandSkeletonsOverBoard(handsLandmarks, puzzle.boardBox);
+    drawHandSkeletonsOverBoard(hands.map(({ landmarks }) => landmarks), puzzle.boardBox);
 
+    const fistProgress = getFistHoldProgress();
     statusText.textContent = puzzle.solved
-      ? (fistHoldCounter > 0
-          ? `guardando… sostén el puño (${fistHoldCounter}/${FIST_HOLD_FRAMES})`
-          : "¡rompecabezas completo! cierra el puño para guardarlo")
-      : "arma el rompecabezas con pinch";
+      ? (fistProgress > 0
+          ? `saving... hold fist ${Math.round(fistProgress * 100)}%`
+          : "puzzle complete - hold fist to save")
+      : "assemble the puzzle with pinch";
   }
 }
 
+let lastDetectionAt = 0;
+
 function renderLoop() {
-  if (videoEl.readyState >= 2 && handLandmarker) {
-    drawVideoFrame();
-    const nowMs = performance.now();
-    const result = handLandmarker.detectForVideo(videoEl, nowMs);
-    processResults(result);
+  if (document.hidden || videoEl.readyState < 2 || !handLandmarker) {
+    requestAnimationFrame(renderLoop);
+    return;
   }
+
+  const nowMs = performance.now();
+  const shouldRender =
+    appState === "shattering" ||
+    nowMs - lastDetectionAt >= DETECTION_INTERVAL_MS;
+
+  if (shouldRender) {
+    drawVideoFrame();
+
+    if (appState === "shattering") {
+      processResults({ landmarks: [] });
+    } else {
+      lastDetectionAt = nowMs;
+      const result = handLandmarker.detectForVideo(videoEl, nowMs);
+      processResults(result);
+    }
+
+    updateGestureGuide();
+  }
+
   requestAnimationFrame(renderLoop);
 }
 
@@ -1157,14 +1385,14 @@ function showError(message) {
 
 function showLoaderError(message) {
   loaderText.textContent = message;
-  loaderText.style.color = "#e0533d";
+  loaderText.style.color = "#ff5a5f";
   loaderRetry.classList.remove("hidden");
 }
 
 function resetLoaderUI() {
   loadingOverlay.classList.remove("hidden");
   loaderText.style.color = "";
-  loaderText.textContent = "cargando modelo HandLandmarker…";
+  loaderText.textContent = "loading hand model...";
   loaderRetry.classList.add("hidden");
   errorBanner.style.display = "none";
 }
@@ -1176,7 +1404,7 @@ async function boot() {
   const watchdogMs = (LOAD_TIMEOUT_MS * 2) + 5000;
   const watchdog = setTimeout(() => {
     if (!settled) {
-      showLoaderError("La carga está tardando demasiado. Pulsa reintentar o revisa tu conexión.");
+      showLoaderError("Loading is taking too long. Try again or check your connection.");
     }
   }, watchdogMs);
 
@@ -1190,17 +1418,20 @@ async function boot() {
     settled = true;
     clearTimeout(watchdog);
     loadingOverlay.classList.add("hidden");
-    statusText.textContent = "listo";
-    requestAnimationFrame(renderLoop);
+    statusText.textContent = "ready";
+    if (!renderLoopStarted) {
+      renderLoopStarted = true;
+      requestAnimationFrame(renderLoop);
+    }
   } catch (err) {
     settled = true;
     clearTimeout(watchdog);
     if (err && err.name === "NotAllowedError") {
-      showLoaderError("Permiso de cámara denegado. Habilítalo en la configuración del navegador y pulsa reintentar.");
+      showLoaderError("Camera permission was denied. Enable it in your browser settings and try again.");
     } else if (err && err.name === "NotFoundError") {
-      showLoaderError("No se encontró ninguna webcam disponible.");
+      showLoaderError("No webcam was found.");
     } else {
-      showLoaderError((err && err.message) || "Error iniciando la app.");
+      showLoaderError((err && err.message) || "Error starting the app.");
     }
   }
 }
@@ -1217,10 +1448,12 @@ if (downloadStripBtn) {
 if (resetAllBtn) {
   resetAllBtn.addEventListener("click", () => {
     const confirmed = window.confirm(
-      "¿Seguro que quieres borrar toda la tira de fotos y empezar de nuevo?"
+      "Clear the whole photo roll and start over?"
     );
     if (confirmed) resetEverything();
   });
 }
+
+window.addEventListener("pagehide", stopCameraStream, { once: true });
 
 boot();

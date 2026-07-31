@@ -1,9 +1,11 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Puzzle Cam — Gesture Capture</title>
+<meta name="theme-color" content="#050609" />
+<meta name="apple-mobile-web-app-title" content="FramePuzzle" />
+<title>FramePuzzle Studio</title>
 <link rel="stylesheet" href="css/styles.css" />
 </head>
 <body>
@@ -15,21 +17,38 @@
     <canvas id="sceneCanvas"></canvas>
 
     <div class="hud-top">
-      <div class="brand">PUZZLE·CAM <small>hand-frame capture</small></div>
+      <div class="brand">FRAMEPUZZLE <small>gesture studio</small></div>
       <div class="status-pill">
         <span id="statusDot" class="status-dot"></span>
-        <span id="statusText">iniciando cámara…</span>
+        <span id="statusText">starting camera...</span>
       </div>
     </div>
 
     <div id="progressBadge" class="progress-badge">
-      <span id="progressText">0 / 9 piezas colocadas</span>
+      <span id="progressText">0 / 9 pieces placed</span>
+    </div>
+
+    <div class="hud-bottom" id="gestureGuide" aria-label="Gesture guide">
+      <div class="gesture-key">
+        <div class="item active" id="gestureCaptureHint">
+          <span class="swatch pinch"></span>
+          <span><strong>Two-hand pinch</strong><small>frame and capture</small></span>
+        </div>
+        <div class="item" id="gestureDragHint">
+          <span class="swatch drag"></span>
+          <span><strong>Pinch a tile</strong><small>move it to its match</small></span>
+        </div>
+        <div class="item" id="gestureFistHint">
+          <span class="swatch fist"></span>
+          <span><strong>Hold fist</strong><small>save or reset</small></span>
+        </div>
+      </div>
     </div>
 
     <div id="loadingOverlay">
-      <div class="loader-text" id="loaderText">cargando modelo HandLandmarker…</div>
+      <div class="loader-text" id="loaderText">loading hand model...</div>
       <div class="loader-bar"></div>
-      <button type="button" id="loaderRetry" class="loader-retry hidden">reintentar</button>
+      <button type="button" id="loaderRetry" class="loader-retry hidden">try again</button>
     </div>
 
     <div id="errorBanner"></div>
@@ -37,23 +56,23 @@
 
   <aside id="gallery">
     <div class="gallery-head">
-      <span class="gallery-title">Tira</span>
+      <span class="gallery-title">Session Roll</span>
       <span class="gallery-count" id="galleryCount">0 / 3</span>
     </div>
 
     <div class="strip-complete-msg" id="stripCompleteMsg">
-      tira completa — descarga o reinicia para seguir
+      roll complete - download or clear to keep shooting
     </div>
 
     <div id="galleryStrip" class="gallery-strip">
       <div class="gallery-empty" id="galleryEmpty">
-        Tus rompecabezas completados<br/>aparecerán aquí.
+        Finished puzzle frames<br/>will collect here.
       </div>
     </div>
 
     <div class="gallery-actions">
-      <button type="button" id="downloadStripBtn" class="gallery-action-btn" disabled>descargar tira</button>
-      <button type="button" id="resetAllBtn" class="gallery-action-btn gallery-action-btn--danger">reiniciar todo</button>
+      <button type="button" id="downloadStripBtn" class="gallery-action-btn" disabled>download roll</button>
+      <button type="button" id="resetAllBtn" class="gallery-action-btn gallery-action-btn--danger">clear session</button>
     </div>
   </aside>
 
