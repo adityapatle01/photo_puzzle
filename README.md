@@ -1,20 +1,24 @@
 # FramePuzzle Studio
 
-FramePuzzle Studio is a browser-based gesture camera puzzle. It uses a webcam and MediaPipe hand tracking to capture a hand-framed photo, split it into a 3x3 puzzle, and save completed puzzles into a downloadable photo roll.
+FramePuzzle Studio is a browser-based gesture camera experience. It starts with a private mode choice, then uses a webcam and MediaPipe hand tracking to capture a hand-framed photo for either a 3x3 puzzle or a direct Classic Photo Booth save.
 
 This version is a personalized edition with a new product identity, refreshed interface, English copy, responsive gallery layout, and stamped photo-roll exports.
 
 ## Features
 
 - Full-field camera preview that avoids CSS zoom/cropping and asks supported cameras for an un-cropped native view
+- Permission-safe landing screen that waits for a Puzzle or Photo Booth choice before starting the camera or MediaPipe
 - Stable 4:3 hand-framed capture using two-hand pinch detection
-- 3x3 drag-and-snap puzzle with deterministic tile swaps, so pieces cannot overlap or silently mis-complete
+- Puzzle Mode with a 3x3 drag-and-snap board and deterministic tile swaps, so pieces cannot overlap or silently mis-complete
+- Classic Photo Booth Mode with a fist-to-save review and a one-tap retake action
+- Change mode link that cancels only the active capture while preserving the shared session roll
 - Adaptive pinch detection, stable hand identity, and a timed fist hold for more reliable gesture control
 - Mouse, trackpad, and touch drag fallback for the puzzle board
 - Black-and-white photo booth treatment with light film noise
 - On-screen gesture guide that highlights the current action
-- Session roll for up to 3 completed puzzle photos
+- Session roll for up to 3 completed photos in capture order
 - Downloadable PNG roll with a FramePuzzle Studio timestamp stamp
+- Optional private Supabase backup of the exact PNG when a user downloads a roll
 - Retry and error states for camera/model loading issues
 
 ## Run Locally
@@ -59,8 +63,18 @@ Allow camera access when the browser asks. The first load also needs internet ac
 | --- | --- |
 | Two hands pinching | Locks the hand-framed area and starts the countdown |
 | One hand pinching over a tile | Drags a puzzle piece |
-| Closed fist hold | Saves a completed puzzle or resets the active board |
-| Mouse, trackpad, or touch drag | Backup control for moving a loose tile |
+| Closed fist hold | Saves a completed puzzle, resets an unfinished board, or saves a Classic review photo |
+| Retake button | Discards a Classic review photo and returns to framing |
+| Mouse, trackpad, or touch drag | Backup control for moving a loose tile in Puzzle Mode |
+
+## Supabase Cloud Backup
+
+`download roll` keeps the local browser download and then uploads that exact PNG to a private Supabase Storage bucket. Anonymous Supabase Auth gives each browser a user ID, and the included migration limits Storage and database access to that user.
+
+1. Add the project publishable key to `supabase-config.js`.
+2. Follow the commands in `supabase/README.md` to push the migration and enable Anonymous Sign-ins.
+
+Never put a Supabase secret or service-role key in this browser project.
 
 ## Project Structure
 

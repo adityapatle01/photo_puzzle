@@ -1,7 +1,7 @@
-import {
-  FilesetResolver,
-  HandLandmarker,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import { SUPABASE_CONFIG } from "./supabase-config.js";
+
+const MEDIAPIPE_MODULE_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const SUPABASE_MODULE_URL = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
 
 const LM = {
   WRIST: 0,
@@ -64,6 +64,12 @@ const gestureHints = {
   drag: document.getElementById("gestureDragHint"),
   fist: document.getElementById("gestureFistHint"),
 };
+const appShell = document.getElementById("app");
+const modeSelect = document.getElementById("modeSelect");
+const modeChoiceButtons = document.querySelectorAll("[data-mode]");
+const changeModeBtn = document.getElementById("changeModeBtn");
+const classicReviewActions = document.getElementById("classicReviewActions");
+const classicRetakeBtn = document.getElementById("classicRetakeBtn");
 
 const galleryStrip = document.getElementById("galleryStrip");
 const galleryEmpty = document.getElementById("galleryEmpty");
@@ -72,9 +78,19 @@ const downloadStripBtn = document.getElementById("downloadStripBtn");
 const resetAllBtn = document.getElementById("resetAllBtn");
 const stripCompleteMsg = document.getElementById("stripCompleteMsg");
 
+let appStage = "modeSelect";
 let appState = "tracking";
+let captureMode = null;
 let cameraStream = null;
 let renderLoopStarted = false;
+let cameraBootToken = 0;
+let mediaPipeModulePromise = null;
+let supabaseModulePromise = null;
+
+const classicReview = {
+  canvas: null,
+  box: null,
+};
 
 const puzzle = {
   boardBox: null,
@@ -97,6 +113,47 @@ const shatter = {
 const STRIP_MAX_PHOTOS = 3;
 const galleryEntries = [];
 const APP_SIGNATURE = "FramePuzzle Studio";
+let cloudBackupClient = null;
+const MODE_TRANSITION_MS = 180;
+
+function updateExperienceControls() {
+  if (classicReviewActions) {
+    classicReviewActions.hidden = appState !== "classic-review";
+  }
+}
+
+function startCameraExperience(mode) {
+  if (!modeSelect || !appShell || !["puzzle", "classic"].includes(mode)) return;
+  if (appStage === "camera") return;
+
+  appStage = "camera";
+  captureMode = mode;
+  resetPuzzleOnly();
+  updateGestureGuide();
+  appShell.hidden = false;
+  window.requestAnimationFrame(() => appShell.classList.add("is-visible"));
+  modeSelect.classList.add("is-leaving");
+  window.setTimeout(() => {
+    if (appStage === "camera") modeSelect.hidden = true;
+  }, MODE_TRANSITION_MS);
+
+  void boot();
+}
+
+function returnToModeSelect() {
+  if (!modeSelect || !appShell || appStage !== "camera") return;
+
+  appStage = "modeSelect";
+  cameraBootToken += 1;
+  resetPuzzleOnly();
+  stopCameraStream();
+  modeSelect.hidden = false;
+  modeSelect.classList.remove("is-leaving");
+  appShell.classList.remove("is-visible");
+  window.setTimeout(() => {
+    if (appStage === "modeSelect") appShell.hidden = true;
+  }, MODE_TRANSITION_MS);
+}
 
 function addToGallery(snapshotCanvas) {
   if (galleryEntries.length >= STRIP_MAX_PHOTOS) return;
@@ -133,6 +190,131 @@ const STRIP_FILE_BORDER = 24;
 const STRIP_FILE_GAP = 16;
 const STRIP_FILE_BG = "#ffffff";
 const STRIP_FILE_CAPTION_H = 42;
+
+function isCloudBackupConfigured() {
+  const { url, publishableKey, storageBucket } = SUPABASE_CONFIG;
+  return Boolean(
+    url &&
+    storageBucket &&
+    publishableKey &&
+    !publishableKey.startsWith("PASTE_")
+  );
+}
+
+async function getCloudBackupClient() {
+  if (!isCloudBackupConfigured()) return null;
+  if (!cloudBackupClient) {
+    if (!supabaseModulePromise) {
+      supabaseModulePromise = import(SUPABASE_MODULE_URL);
+    }
+    const { createClient } = await supabaseModulePromise;
+    cloudBackupClient = createClient(
+      SUPABASE_CONFIG.url,
+      SUPABASE_CONFIG.publishableKey,
+      { auth: { persistSession: true, autoRefreshToken: true } }
+    );
+  }
+  return cloudBackupClient;
+}
+
+async function getCloudBackupUser(client) {
+  const { data: sessionData, error: sessionError } = await client.auth.getSession();
+  if (sessionError) throw sessionError;
+  if (sessionData.session?.user) return sessionData.session.user;
+
+  const { data, error } = await client.auth.signInAnonymously();
+  if (error) {
+    throw new Error(
+      "Cloud sign-in was rejected. Enable Anonymous Sign-ins in Supabase Auth."
+    );
+  }
+
+  const user = data.user || data.session?.user;
+  if (!user) throw new Error("Cloud sign-in did not return a user.");
+  return user;
+}
+
+async function backupPhotoRollToCloud(blob, fileName, photoCount) {
+  const client = await getCloudBackupClient();
+  if (!client) return;
+
+  try {
+    const user = await getCloudBackupUser(client);
+    const storagePath = `${user.id}/${fileName}`;
+    const { error: uploadError } = await client.storage
+      .from(SUPABASE_CONFIG.storageBucket)
+      .upload(storagePath, blob, {
+        cacheControl: "3600",
+        contentType: "image/png",
+        upsert: false,
+      });
+    if (uploadError) throw uploadError;
+
+    const { error: metadataError } = await client
+      .from("photo_rolls")
+      .insert({
+        user_id: user.id,
+        storage_path: storagePath,
+        file_name: fileName,
+        photo_count: photoCount,
+        size_bytes: blob.size,
+      });
+
+    if (metadataError) {
+      await client.storage.from(SUPABASE_CONFIG.storageBucket).remove([storagePath]);
+      throw metadataError;
+    }
+
+  } catch (error) {
+    console.error("[FramePuzzle] Cloud photo-roll backup failed.", error);
+  }
+}
+
+async function fetchCloudPhotoRolls() {
+  const client = await getCloudBackupClient();
+  if (!client) {
+    throw new Error("Supabase key is not configured.");
+  }
+  const user = await getCloudBackupUser(client);
+  const { data, error } = await client
+    .from("photo_rolls")
+    .select("*")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+
+  const items = await Promise.all(
+    (data || []).map(async (row) => {
+      const { data: urlData } = await client.storage
+        .from(SUPABASE_CONFIG.storageBucket)
+        .createSignedUrl(row.storage_path, 3600);
+      return {
+        ...row,
+        signedUrl: urlData?.signedUrl || null,
+      };
+    })
+  );
+
+  return items;
+}
+
+async function deleteCloudPhotoRoll(id, storagePath) {
+  const client = await getCloudBackupClient();
+  if (!client) throw new Error("Supabase key is not configured.");
+
+  const { error: storageError } = await client.storage
+    .from(SUPABASE_CONFIG.storageBucket)
+    .remove([storagePath]);
+  if (storageError) console.warn("[FramePuzzle] Storage remove notice:", storageError);
+
+  const { error: dbError } = await client
+    .from("photo_rolls")
+    .delete()
+    .eq("id", id);
+
+  if (dbError) throw dbError;
+}
 
 function downloadPhotoStrip() {
   if (galleryEntries.length === 0) return;
@@ -180,12 +362,16 @@ function downloadPhotoStrip() {
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
+    const fileName = `framepuzzle_roll_${Date.now()}.png`;
     link.href = url;
-    link.download = `framepuzzle_roll_${Date.now()}.png`;
+    link.download = fileName;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     setTimeout(() => URL.revokeObjectURL(url), 4000);
+
+    // The user download remains immediate; the same Blob is backed up separately.
+    void backupPhotoRollToCloud(blob, fileName, entries.length);
   }, "image/png");
 }
 
@@ -225,7 +411,7 @@ function renderGalleryThumb(snapshotCanvas, index) {
   print.appendChild(thumbCanvas);
   print.appendChild(label);
   print.appendChild(meta);
-  galleryStrip.insertBefore(print, galleryStrip.firstChild);
+  galleryStrip.appendChild(print);
 }
 
 function formatClock(date) {
@@ -247,6 +433,8 @@ function resetPuzzleOnly() {
   puzzle.pieces = [];
   puzzle.solved = false;
   puzzle.fullPhotoboothCanvas = null;
+  classicReview.canvas = null;
+  classicReview.box = null;
   appState = "tracking";
   countdown.active = false;
   drag.activeHand = null;
@@ -260,6 +448,7 @@ function resetPuzzleOnly() {
   lastSeenFrame.box = null;
   lastSeenFrame.at = 0;
   updateProgressBadge();
+  updateExperienceControls();
 }
 
 function fitCanvasToWindow() {
@@ -398,6 +587,11 @@ function withTimeout(promise, ms, timeoutMessage) {
 }
 
 async function initHandLandmarker() {
+  if (!mediaPipeModulePromise) {
+    mediaPipeModulePromise = import(MEDIAPIPE_MODULE_URL);
+  }
+  const { FilesetResolver, HandLandmarker } = await mediaPipeModulePromise;
+
   let vision;
   try {
     vision = await withTimeout(
@@ -413,7 +607,7 @@ async function initHandLandmarker() {
   for (const delegate of getHandDelegateOrder()) {
     try {
       return await withTimeout(
-        createHandLandmarker(vision, delegate),
+        createHandLandmarker(vision, delegate, HandLandmarker),
         LOAD_TIMEOUT_MS,
         `Timed out loading the HandLandmarker model with ${delegate}.`
       );
@@ -430,7 +624,7 @@ function getHandDelegateOrder() {
   return isSafariBrowser() ? ["CPU", "GPU"] : ["GPU", "CPU"];
 }
 
-function createHandLandmarker(vision, delegate) {
+function createHandLandmarker(vision, delegate, HandLandmarker) {
   return HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: HAND_MODEL_URL,
@@ -569,6 +763,7 @@ function startCountdown(frameBox) {
   appState = "countdown";
   countdown.active = true;
   countdown.startedAt = performance.now();
+  updateExperienceControls();
 }
 
 function drawCountdownOverlay(box) {
@@ -673,6 +868,20 @@ function finishCountdownAndCapture(box) {
 
   puzzle.fullPhotoboothCanvas = cropCanvas;
 
+  if (captureMode === "classic") {
+    classicReview.canvas = cropCanvas;
+    classicReview.box = { ...box };
+    puzzle.boardBox = null;
+    puzzle.pieces = [];
+    puzzle.solved = false;
+    puzzle.fullPhotoboothCanvas = null;
+    appState = "classic-review";
+    fistHoldStartedAt = 0;
+    updateProgressBadge();
+    updateExperienceControls();
+    return;
+  }
+
   const tileW = Math.floor(cropCanvas.width / GRID);
   const tileH = Math.floor(cropCanvas.height / GRID);
   const pieces = [];
@@ -723,6 +932,7 @@ function finishCountdownAndCapture(box) {
   appState = "puzzle";
   fistHoldStartedAt = 0;
   updateProgressBadge();
+  updateExperienceControls();
 }
 
 function correctCellPosition(piece, box, tileW, tileH) {
@@ -953,6 +1163,31 @@ function drawBoardAndPieces() {
   }
 }
 
+function drawClassicReview() {
+  const { canvas: reviewCanvas, box } = classicReview;
+  if (!reviewCanvas || !box) return;
+
+  const pulse = 0.72 + Math.sin(performance.now() / 260) * 0.18;
+  const labelHeight = Math.max(30, Math.round(box.height * 0.13));
+
+  ctx.save();
+  ctx.drawImage(reviewCanvas, box.x, box.y, box.width, box.height);
+  ctx.shadowColor = `rgba(255, 202, 58, ${pulse})`;
+  ctx.shadowBlur = 16;
+  ctx.strokeStyle = "#ffca3a";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(box.x, box.y, box.width, box.height);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "rgba(5, 6, 9, 0.62)";
+  ctx.fillRect(box.x, box.y + box.height - labelHeight, box.width, labelHeight);
+  ctx.font = `${Math.max(12, Math.min(22, box.width * 0.05))}px 'IBM Plex Mono', monospace`;
+  ctx.fillStyle = "#f4f0e8";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("REVIEW - HOLD FIST TO SAVE", box.x + box.width / 2, box.y + box.height - labelHeight / 2);
+  ctx.restore();
+}
+
 function updateProgressBadge() {
   if (appState !== "puzzle") {
     progressBadge.classList.remove("visible", "solved");
@@ -964,18 +1199,62 @@ function updateProgressBadge() {
   progressBadge.classList.toggle("solved", puzzle.solved);
 }
 
-function updateGestureGuide() {
-  let activeGesture = "capture";
+const gestureHintState = new Map();
 
-  if (appState === "puzzle") {
-    activeGesture = puzzle.solved ? "fist" : "drag";
-  } else if (appState === "shattering" || (appState === "tracking" && isStripFull())) {
-    activeGesture = null;
+function setGestureHint(key, title, detail, swatch, active) {
+  const element = gestureHints[key];
+  if (!element) return;
+
+  const signature = `${title}|${detail}|${swatch}|${active}`;
+  if (gestureHintState.get(key) === signature) return;
+  gestureHintState.set(key, signature);
+
+  const titleEl = element.querySelector("strong");
+  const detailEl = element.querySelector("small");
+  const swatchEl = element.querySelector(".swatch");
+  if (titleEl) titleEl.textContent = title;
+  if (detailEl) detailEl.textContent = detail;
+  if (swatchEl) swatchEl.className = `swatch ${swatch}`;
+  element.classList.toggle("active", active);
+}
+
+function updateGestureGuide() {
+  if (appState === "countdown") {
+    setGestureHint("capture", "countdown locked", "pose changes will not cancel", "pinch", true);
+    setGestureHint("drag", "capturing frame", "photo booth treatment next", "review", false);
+    setGestureHint("fist", "hold fist", "save when the photo is ready", "fist", false);
+    return;
   }
 
-  Object.entries(gestureHints).forEach(([gesture, el]) => {
-    if (el) el.classList.toggle("active", gesture === activeGesture);
-  });
+  if (appState === "classic-review") {
+    setGestureHint("capture", "photo review", "captured frame ready", "review", false);
+    setGestureHint("drag", "tap retake", "discard and try again", "retake", true);
+    setGestureHint("fist", "hold fist", "save this photo", "fist", true);
+    return;
+  }
+
+  if (appState === "puzzle") {
+    setGestureHint("capture", "two-hand pinch", "frame and capture", "pinch", false);
+    setGestureHint("drag", "pinch a tile", "move it to its match", "drag", !puzzle.solved);
+    setGestureHint("fist", "hold fist", "save or reset", "fist", puzzle.solved);
+    return;
+  }
+
+  if (appState === "shattering" || (appState === "tracking" && isStripFull())) {
+    setGestureHint("capture", "roll complete", "download or clear to continue", "pinch", false);
+    setGestureHint("drag", "session full", "up to three finished frames", "review", false);
+    setGestureHint("fist", "hold fist", "not needed right now", "fist", false);
+    return;
+  }
+
+  setGestureHint("capture", "two-hand pinch", "frame and capture", "pinch", true);
+  if (captureMode === "classic") {
+    setGestureHint("drag", "classic mode", "review before saving", "review", false);
+    setGestureHint("fist", "hold fist", "save the reviewed photo", "fist", false);
+  } else {
+    setGestureHint("drag", "pinch a tile", "move it to its match", "drag", false);
+    setGestureHint("fist", "hold fist", "save or reset", "fist", false);
+  }
 }
 
 function drawVideoFrame() {
@@ -1123,6 +1402,7 @@ function startShatter(sourceCanvas, box) {
   shatter.active = true;
   shatter.startedAt = performance.now();
   appState = "shattering";
+  updateExperienceControls();
 }
 
 function updateAndDrawShatter() {
@@ -1169,6 +1449,33 @@ function finishShatter() {
   resetPuzzleOnly();
 }
 
+function saveClassicReview() {
+  if (!classicReview.canvas) {
+    resetPuzzleOnly();
+    return;
+  }
+
+  addToGallery(classicReview.canvas);
+  resetPuzzleOnly();
+  statusText.textContent = isStripFull()
+    ? "roll complete - download or clear"
+    : "saved to the roll";
+}
+
+function retakeClassicPhoto() {
+  if (appState !== "classic-review") return;
+  resetPuzzleOnly();
+  statusText.textContent = "retake ready - set your frame";
+}
+
+function handleFistAction() {
+  if (appState === "classic-review") {
+    saveClassicReview();
+    return;
+  }
+  handleFistReset();
+}
+
 function handleFistReset() {
   if (appState !== "puzzle") {
     statusText.textContent = "board reset by fist hold";
@@ -1207,7 +1514,9 @@ function processResults(result) {
   const noHands = hands.length === 0;
 
   if (noHands) {
-    statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot";
+    statusDot.className = (puzzle.solved || appState === "classic-review")
+      ? "status-dot solved"
+      : "status-dot";
     fistHoldStartedAt = 0;
     freezeGate.holding = false;
     pinchStates.clear();
@@ -1233,6 +1542,12 @@ function processResults(result) {
       return;
     }
 
+    if (appState === "classic-review") {
+      drawClassicReview();
+      statusText.textContent = "photo ready - hold fist to save";
+      return;
+    }
+
     if (appState === "puzzle") {
       puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
       updateProgressBadge();
@@ -1244,17 +1559,20 @@ function processResults(result) {
     return;
   }
 
-  statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot live";
+  statusDot.className = appState === "classic-review"
+    ? "status-dot armed"
+    : (puzzle.solved ? "status-dot solved" : "status-dot live");
 
   const anyFist = hands.some(({ landmarks }) => isFist(landmarks));
   const draggingNow = drag.activeHand !== null && drag.piece !== null;
 
   // Once the countdown begins, preserve it regardless of the pose the user makes.
-  if (appState === "puzzle" && anyFist && !draggingNow) {
+  const canHandleFist = appState === "puzzle" || appState === "classic-review";
+  if (canHandleFist && anyFist && !draggingNow) {
     if (!fistHoldStartedAt) fistHoldStartedAt = performance.now();
     if (performance.now() - fistHoldStartedAt >= FIST_HOLD_MS) {
       fistHoldStartedAt = 0;
-      handleFistReset();
+      handleFistAction();
       return;
     }
   } else {
@@ -1313,6 +1631,15 @@ function processResults(result) {
     return;
   }
 
+  if (appState === "classic-review") {
+    drawClassicReview();
+    const fistProgress = getFistHoldProgress();
+    statusText.textContent = fistProgress > 0
+      ? `saving... hold fist ${Math.round(fistProgress * 100)}%`
+      : "photo ready - hold fist to save";
+    return;
+  }
+
   if (appState === "puzzle") {
     const activeHandIds = new Set();
     hands.forEach(({ landmarks, id }) => {
@@ -1351,7 +1678,7 @@ function processResults(result) {
 let lastDetectionAt = 0;
 
 function renderLoop() {
-  if (document.hidden || videoEl.readyState < 2 || !handLandmarker) {
+  if (appStage !== "camera" || document.hidden || videoEl.readyState < 2 || !handLandmarker) {
     requestAnimationFrame(renderLoop);
     return;
   }
@@ -1398,6 +1725,8 @@ function resetLoaderUI() {
 }
 
 async function boot() {
+  if (appStage !== "camera") return;
+  const bootToken = ++cameraBootToken;
   resetLoaderUI();
 
   let settled = false;
@@ -1413,7 +1742,22 @@ async function boot() {
       await initWebcam();
     }
 
-    handLandmarker = await initHandLandmarker();
+    if (appStage !== "camera" || bootToken !== cameraBootToken) {
+      settled = true;
+      clearTimeout(watchdog);
+      stopCameraStream();
+      return;
+    }
+
+    if (!handLandmarker) {
+      handLandmarker = await initHandLandmarker();
+    }
+
+    if (appStage !== "camera" || bootToken !== cameraBootToken) {
+      settled = true;
+      clearTimeout(watchdog);
+      return;
+    }
 
     settled = true;
     clearTimeout(watchdog);
@@ -1426,6 +1770,7 @@ async function boot() {
   } catch (err) {
     settled = true;
     clearTimeout(watchdog);
+    if (appStage !== "camera") return;
     if (err && err.name === "NotAllowedError") {
       showLoaderError("Camera permission was denied. Enable it in your browser settings and try again.");
     } else if (err && err.name === "NotFoundError") {
@@ -1437,13 +1782,27 @@ async function boot() {
 }
 
 loaderRetry.addEventListener("click", () => {
-  boot();
+  if (appStage === "camera") void boot();
 });
 
 if (downloadStripBtn) {
   downloadStripBtn.addEventListener("click", downloadPhotoStrip);
   updateStripDownloadAvailability();
 }
+
+modeChoiceButtons.forEach((button) => {
+  button.addEventListener("click", () => startCameraExperience(button.dataset.mode));
+});
+
+if (changeModeBtn) {
+  changeModeBtn.addEventListener("click", returnToModeSelect);
+}
+
+if (classicRetakeBtn) {
+  classicRetakeBtn.addEventListener("click", retakeClassicPhoto);
+}
+
+updateExperienceControls();
 
 if (resetAllBtn) {
   resetAllBtn.addEventListener("click", () => {
@@ -1455,5 +1814,3 @@ if (resetAllBtn) {
 }
 
 window.addEventListener("pagehide", stopCameraStream, { once: true });
-
-boot();
